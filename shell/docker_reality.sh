@@ -202,18 +202,64 @@ renderXHTTPPath() {
     printf '/%sxHTTP' "$1"
 }
 
-urlEncode() {
-    local input="$1"
-    local length=${#input}
-    local index char
+# getPublicIP — 尝试获取当前主机的公网 IP，用于展示 Reality 连接信息。
+getPublicIP() {
+    local currentIP=""
 
-    for ((index = 0; index < length; index++)); do
-        char="${input:index:1}"
-        case "${char}" in
-        [a-zA-Z0-9.~_-]) printf '%s' "${char}" ;;
-        *) printf '%%%02X' "'${char}" ;;
-        esac
-    done
+    if command -v curl >/dev/null 2>&1; then
+        currentIP=$(curl -fsS -4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
+        if [[ -z "${currentIP}" ]]; then
+            currentIP=$(curl -fsS -6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
+        fi
+        if [[ -z "${currentIP}" ]]; then
+            currentIP=$(curl -fsS https://api.ipify.org 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -z "${currentIP}" ]]; then
+        currentIP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+
+    printf '%s' "${currentIP}"
+}
+
+# ensureQRCodeTool — 确保 Docker CLI 的本地二维码输出具备 qrencode 依赖。
+# 仅在缺少依赖时安装；二维码生成本身不会访问第三方服务。
+ensureQRCodeTool() {
+    if command -v qrencode >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echoContent "white" "本地二维码需要 qrencode，正在尝试安装..."
+    if command -v apt-get >/dev/null 2>&1; then
+        if apt-get update >/dev/null 2>&1; then
+            apt-get install -y qrencode >/dev/null 2>&1 || true
+        fi
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache qrencode >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y qrencode >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y qrencode >/dev/null 2>&1 || true
+    fi
+
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echoContent "red" "无法安装 qrencode，请先手动安装后重试"
+        return 1
+    fi
+}
+
+# printLocalQRCode — 使用本机 qrencode 将原始订阅 URI 渲染为终端二维码。
+# 原始 URI 直接作为二维码内容，避免依赖远程 QR 服务的 URL 编码层。
+printLocalQRCode() {
+    local qrData="$1"
+
+    if ! command -v qrencode >/dev/null 2>&1; then
+        echoContent "red" " ---> 未找到 qrencode，无法生成本地二维码"
+        return 1
+    fi
+
+    printf '%s\n' "${qrData}" | qrencode -s 10 -m 1 -t UTF8
 }
 
 # buildVisionSubscriptionLink — 生成 Vision 订阅 URI，空字段时返回失败。
@@ -1365,27 +1411,6 @@ loadPersistedPort() {
     loadPersistedStateFromConfig
 }
 
-# getPublicIP — 尝试获取当前主机的公网 IP，用于展示 Reality 连接信息。
-getPublicIP() {
-    local currentIP=""
-
-    if command -v curl >/dev/null 2>&1; then
-        currentIP=$(curl -fsS -4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
-        if [[ -z "${currentIP}" ]]; then
-            currentIP=$(curl -fsS -6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | awk -F '=' '{print $2}')
-        fi
-        if [[ -z "${currentIP}" ]]; then
-            currentIP=$(curl -fsS https://api.ipify.org 2>/dev/null || true)
-        fi
-    fi
-
-    if [[ -z "${currentIP}" ]]; then
-        currentIP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-    fi
-
-    printf '%s' "${currentIP}"
-}
-
 # loadPersistedAccountInfo — 从持久化摘要（优先）或 config.json 恢复展示所需的账号信息。
 # 设置：persistedInstallMode、persistedVisionPort、persistedXHTTPPort、
 #       persistedXHTTPPath、persistedServerName、persistedPublicKey、
@@ -1722,7 +1747,7 @@ showVisionAccount() {
     local displayUUID="$5"
     local displayEmail="$6"
     local displayShortId="$7"
-    local vlessLink qrData qrLink
+    local vlessLink
 
     if [[ -z "${displayAddress}" ]]; then
         displayAddress="YOUR_SERVER_IP"
@@ -1733,15 +1758,6 @@ showVisionAccount() {
         echoContent "yellow" " ---> Vision 账号信息不完整，已跳过订阅链接输出"
         return 0
     fi
-    qrData="${vlessLink//:/%3A}"
-    qrData="${qrData//\//%2F}"
-    qrData="${qrData//@/%40}"
-    qrData="${qrData//\?/%3F}"
-    qrData="${qrData//&/%26}"
-    qrData="${qrData//#/%23}"
-    qrData="${qrData//=/%3D}"
-    qrLink="https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${qrData}"
-
     echoContent "skyBlue" "============================= VLESS reality_vision [推荐]  =============================="
     echoContent "skyBlue" ""
     echoContent "skyBlue" " ---> 账号:${displayEmail}"
@@ -1753,7 +1769,7 @@ showVisionAccount() {
     echoContent "green" "协议类型:VLESS reality，地址:${displayAddress}，publicKey:${displayPublicKey}，shortId: ${displayShortId}，serverNames：${displayServerName}，端口:${displayPort}，用户ID:${displayUUID}，传输方式:tcp，账户名:${displayEmail}"
     echoContent "white" ""
     echoContent "yellow" " ---> 二维码 VLESS(VLESS+reality+uTLS+Vision)"
-    echoContent "green" "    ${qrLink}"
+    printLocalQRCode "${vlessLink}"
 }
 
 # showXHTTPAccount — 以 install.sh showAccounts 风格展示 XHTTP 账号。
@@ -1767,7 +1783,7 @@ showXHTTPAccount() {
     local displayEmail="$6"
     local displayShortId="$7"
     local displayPath="$8"
-    local vlessLink qrLink
+    local vlessLink
 
     if [[ -z "${displayAddress}" ]]; then
         displayAddress="YOUR_SERVER_IP"
@@ -1778,8 +1794,6 @@ showXHTTPAccount() {
         echoContent "yellow" " ---> XHTTP 账号信息不完整，已跳过订阅链接输出"
         return 0
     fi
-    qrLink="https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${displayUUID}%40${displayAddress}%3A${displayPort}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${displayServerName}%26fp%3Dchrome%26path%3D${displayPath}%26host%3D${displayServerName}%26pbk%3D${displayPublicKey}%26sid%3D${displayShortId}%23${displayEmail}"
-
     echoContent "skyBlue" "============================= VLESS reality_xhttp  =============================="
     echoContent "skyBlue" ""
     echoContent "skyBlue" " ---> 账号:${displayEmail}"
@@ -1791,7 +1805,7 @@ showXHTTPAccount() {
     echoContent "green" "协议类型:VLESS reality，地址:${displayAddress}，publicKey:${displayPublicKey}，shortId: ${displayShortId}，serverNames：${displayServerName}，端口:${displayPort}，路径：${displayPath}，SNI:${displayServerName}，伪装域名:${displayServerName}，用户ID:${displayUUID}，传输方式:xhttp，账户名:${displayEmail}"
     echoContent "white" ""
     echoContent "yellow" " ---> 二维码 VLESS(VLESS+reality+xhttp)"
-    echoContent "green" "    ${qrLink}"
+    printLocalQRCode "${vlessLink}"
 }
 
 # showChineseSubscriptionSection — 输出本地中文订阅内容与风险提示。
@@ -1886,13 +1900,15 @@ showChineseSubscriptionSection() {
     echoContent "white" ""
     echoContent "green" "email: ${subscribeName}"
     echoContent "yellow" "url: ${subscribeURL}"
-    echoContent "yellow" "在线二维码: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=$(urlEncode "${subscribeURL}")"
+    echoContent "yellow" "本地二维码:"
+    printLocalQRCode "${subscribeURL}"
     if [[ -n "${clashProfileURL}" ]]; then
         echo
         echoContent "skyBlue" "--------------Clash Verge(mihomo)订阅--------------"
         echo
         echoContent "yellow" "url: ${clashProfileURL}"
-        echoContent "yellow" "在线二维码: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=$(urlEncode "${clashProfileURL}")"
+        echoContent "yellow" "本地二维码:"
+        printLocalQRCode "${clashProfileURL}"
     fi
 }
 
@@ -2382,6 +2398,7 @@ showAccountInfo() {
     local shortId=""
 
     loadPersistedAccountInfo
+    ensureQRCodeTool || exit 1
     displayAddress="$(getPublicIP)"
     mode="${persistedInstallMode}"
     shortId="${persistedShortId:-6ba85179e30d4fc2}"
@@ -2420,6 +2437,7 @@ showSubscriptionInfo() {
 
     loadPersistedAccountInfo
     ensureSubscribeRuntimeValues
+    ensureQRCodeTool || exit 1
     displayAddress="$(getPublicIP)"
     mode="${persistedInstallMode}"
     shortId="${persistedShortId:-6ba85179e30d4fc2}"
@@ -2464,6 +2482,7 @@ main() {
     fi
 
     if [[ "${generateOnly}" != "1" ]]; then
+        ensureQRCodeTool || exit 1
         startContainer
         showClientInfo
     fi
